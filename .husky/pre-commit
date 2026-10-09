@@ -1,0 +1,76 @@
+#!/bin/sh
+# Pre-commit gate (husky). Runs the same checks as the CI "quality" job,
+# limited to the staged change set where that is possible. Husky executes
+# hooks with `sh -e`; `set -e` keeps the behaviour identical when the script
+# is run by hand (`sh .husky/pre-commit`).
+set -e
+
+for tool in go task goimports golangci-lint; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "pre-commit: '$tool' is not installed (see README > Run it)." >&2
+    exit 1
+  fi
+done
+
+# ── Generated files ────────────────────────────────────────────────────
+# CI variables, Mongo field constants, Wire injectors and OpenAPI. Task skips
+# any generator whose sources have not changed.
+echo "=> Regenerating CI variables and generated code..."
+task sync:ci-vars gen:mongo gen:wire gen:api-docs
+
+# Generator output must be staged with the change that caused it, otherwise
+# the drift checks in CI fail on this commit.
+GEN_DIRTY=$(git diff --name-only -- \
+  .gitlab-ci.variables.yml \
+  internal/storage/mongo/field \
+  internal/storage/mongo/collections.go \
+  services/api/wire/wire_gen.go \
+  services/worker/wire/wire_gen.go \
+  docs/api)
+if [ -n "$GEN_DIRTY" ]; then
+  echo "" >&2
+  echo "ERROR: generators changed files that are not staged:" >&2
+  echo "$GEN_DIRTY" | sed 's/^/   /' >&2
+  echo "" >&2
+  echo "Review them, then:  git add $(echo "$GEN_DIRTY" | tr '\n' ' ')" >&2
+  exit 1
+fi
+
+# ── Architecture rules ─────────────────────────────────────────────────
+echo "=> Checking architecture constraints..."
+task arch-check
+
+# ── Staged Go files: format + lint ─────────────────────────────────────
+STAGED_GO=$(git diff --cached --name-only --diff-filter=d -- '*.go')
+if [ -z "$STAGED_GO" ]; then
+  echo "=> No staged .go files; skipping fmt/lint."
+  exit 0
+fi
+
+echo "=> Checking formatting of staged .go files..."
+UNFORMATTED=$(echo "$STAGED_GO" | xargs gofmt -l)
+# wire_gen.go is generated and wire controls its imports; drift covers it.
+GOIMPORTS_FILES=$(echo "$STAGED_GO" | grep -v 'wire_gen\.go$' || true)
+UNIMPORTED=""
+if [ -n "$GOIMPORTS_FILES" ]; then
+  UNIMPORTED=$(echo "$GOIMPORTS_FILES" | xargs goimports -l)
+fi
+if [ -n "$UNFORMATTED$UNIMPORTED" ]; then
+  echo "" >&2
+  echo "ERROR: staged files are not formatted:" >&2
+  printf '%s\n%s\n' "$UNFORMATTED" "$UNIMPORTED" | sed '/^$/d' | sort -u | sed 's/^/   /' >&2
+  echo "" >&2
+  echo "Run:  gofmt -w <files> && goimports -w <files>   then re-stage." >&2
+  exit 1
+fi
+echo "   Formatting OK."
+
+echo "=> Running golangci-lint..."
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+  # Only issues introduced since HEAD; keeps the hook fast on a large tree.
+  golangci-lint run --new-from-rev=HEAD --timeout=5m
+else
+  # First commit of the repository: there is no baseline yet, lint everything.
+  golangci-lint run ./... --timeout=10m
+fi
+echo "   Lint OK."

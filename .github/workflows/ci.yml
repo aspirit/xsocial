@@ -1,0 +1,135 @@
+# CI for every push / PR. Every step calls the same Taskfile targets developers
+# run locally; toolchain versions come from versions.env (single source of truth).
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: format · lint · architecture · generated code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load versions.env
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install goimports
+        run: go install golang.org/x/tools/cmd/goimports@latest
+      - name: Format
+        run: task fmt:check
+      - name: Architecture rules
+        run: task arch-check
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v${{ env.GOLANGCI_LINT_VERSION }}
+          args: --timeout=10m
+      - name: Integration-tagged tests compile (lint runs without the tag)
+        run: task vet:integration
+      - name: Generated code is up to date (mongo fields, wire, openapi)
+        run: task gen:check
+      - name: CI variables match versions.env
+        run: bash tools/generate-ci-vars.sh && git diff --exit-code .gitlab-ci.variables.yml
+
+  unit:
+    name: unit tests (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go test -race -count=1 ./...
+
+  integration:
+    name: integration + e2e (MongoDB replica set, Redis)
+    runs-on: ubuntu-latest
+    env:
+      MONGODB_URI_PRIMARY: mongodb://127.0.0.1:27017 # the test harness initiates the replica set
+      CACHE_ADDRESS: 127.0.0.1:6379
+      CI_STRICT_INTEGRATION: "1" # a missing service, or a standalone MongoDB, fails the job instead of skipping
+    steps:
+      - uses: actions/checkout@v4
+      - run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # Started by hand rather than as service containers: image versions come from
+      # versions.env (loaded above, not visible to service definitions), and MongoDB
+      # needs --replSet so transactions in the integration tests are real and the
+      # rollback test runs instead of skipping.
+      - name: Start MongoDB (single-node replica set) and Redis
+        run: |
+          docker run -d --name mongo -p 127.0.0.1:27017:27017 "mongo:${MONGO_VERSION}" --replSet rs0 --bind_ip_all
+          docker run -d --name redis -p 127.0.0.1:6379:6379 "redis:${REDIS_VERSION}"
+          for i in $(seq 1 30); do
+            docker exec mongo mongosh --quiet --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1 &&
+              docker exec redis redis-cli ping >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          echo "services did not start"; docker logs mongo; docker logs redis; exit 1
+      - run: go test -race -count=1 -tags=integration -coverprofile=coverage.out ./...
+      - run: go tool cover -func=coverage.out | tail -1
+
+  images:
+    name: docker images
+    needs: [quality, unit, integration]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [api, worker]
+    steps:
+      - uses: actions/checkout@v4
+      - run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Valid tags for every event: github.ref_name is "123/merge" on pull requests,
+      # which is not a legal Docker tag. Every build is tagged sha-<commit>; a v*
+      # tag adds the semver tag (only those builds are pushed).
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.service }}
+          tags: |
+            type=sha,format=long
+            type=semver,pattern={{version}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GO_VERSION=${{ env.GO_VERSION }}
+            ALPINE_VERSION=${{ env.ALPINE_VERSION }}
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

@@ -1,0 +1,207 @@
+# Default configuration for the project
+# Overridable by config.{env}.yaml
+version: 0.1.0
+
+# Configuration metadata
+meta:
+  last_updated: 2026-10-01T00:00:00Z
+  description: Default configuration (local development)
+  owner: backend
+
+# Project-wide settings
+project:
+  id: xs
+  mode: debug # Global mode: debug, release
+
+# Feature flags for gray releases
+features:
+  new_register:
+    enabled: false
+    rollout_percentage: 10 # Percentage of users (0-100)
+
+# Services configuration
+services:
+  api:
+    id: xs-api
+    addr: ":8080"
+    read_timeout: 5s
+    write_timeout: 10s
+    idle_timeout: 30s
+    shutdown_timeout: 10s
+    # Reverse proxies trusted to set X-Forwarded-For (client IP). Empty = trust
+    # none (ClientIP = direct peer, cannot be spoofed). In production set this to
+    # the ingress gateway IP/CIDR only, e.g. ["10.0.0.0/8"] or the LB address.
+    trusted_proxies: []
+    # CORS configuration - only environment-specific settings
+    cors:
+      enabled: true
+      allow_origins:
+        - "http://localhost:5173"   # local web client
+        - "http://127.0.0.1:5173"
+        - "http://localhost:8080"   # local API testing (Swagger UI)
+      allow_credentials: true
+      allow_wildcard_subdomains: false
+  worker:
+    id: xs-worker
+    addr: ":8082" # reserved; the worker serves no HTTP endpoint in this extract
+    read_timeout: 5s
+    write_timeout: 10s
+    idle_timeout: 30s
+    shutdown_timeout: 10s
+
+# Worker job configuration (notification consumer, etc.)
+worker_jobs:
+  notification:
+    poll_interval: 3s
+    batch_size: 50
+    # Events for one (recipient, action, target) merge into its single unread
+    # inbox entry until the recipient reads it. who keeps at most N actors for
+    # display; who_count counts every merged event.
+    who_max_size: 10
+  # Periodic counter reconciliation (post.like_count vs the post_like collection).
+  reconcile:
+    enabled: true
+    interval: 1h       # Run once at startup, then every interval
+    correct: true      # Repair detected drift (false = report-only / dry-run)
+
+# Logging configuration
+logging:
+  level: debug
+  output_path: stdout
+  format: console
+  development: true
+
+# Rate limiting (API).
+# storage: memory (in-process) | cache (shared cache backend: Redis/Memorystore/etc.)
+# NOTE: must be enabled in release mode (the API fail-fasts on release + disabled).
+# Production should set enabled: true and storage: cache (shared atomic counters).
+ratelimit:
+  enabled: false
+  storage: "memory"
+  # Per-IP ceiling for device-scoped policies = policy.requests * this, so
+  # cycling X-Device-ID cannot bypass per-device limits. Default 5 when <= 0.
+  ip_hard_limit_multiplier: 5
+  global:
+    requests: 120
+    window: "1m"
+  # Config supplies name/requests/window only; method, path and keying live in
+  # code next to the routes (services/api/router/ratelimit_policies.go).
+  policies:
+    - name: "login"
+      requests: 5
+    - name: "signup"
+      requests: 3
+      window: "10m"
+    - name: "refresh_token"
+      requests: 20
+    - name: "write"
+      requests: 60
+
+# Data storage and messaging systems
+storage:
+  mongodb: 
+    primary:
+      # Connection settings
+      uri: ${MONGODB_URI_PRIMARY}  # Sensitive, from .env
+      username: ${MONGODB_USERNAME_PRIMARY}
+      password: ${MONGODB_PASSWORD_PRIMARY}
+      auth_source: admin
+      
+      # Connection pool settings
+      pool_size: 50
+      min_pool_size: 5
+      max_idle_time: 30s
+      
+      # Timeout settings
+      connect_timeout: 10s
+      socket_timeout: 30s
+      server_selection_timeout: 30s
+      
+      # Read/Write preferences. Reads go to the primary so a write is visible to
+      # the next read (read-your-writes).
+      read_preference: primary
+      write_concern: majority
+      read_concern: local
+      
+      # Retry settings
+      retry_writes: true
+      retry_reads: true
+      
+      # Compression settings (optional)
+      compressors: [snappy, zlib]
+      
+  redis:
+    address: ${CACHE_ADDRESS} # Sensitive, from .env
+    password: ${CACHE_PASSWORD} # Sensitive, from .env
+    tls_enabled: ${CACHE_TLS_ENABLED:-false} # true for GCP Memorystore (production)
+  # Cache: redis (local) or memorystore (GCP). Uses storage.redis for connection.
+  cache:
+    type: ${CACHE_TYPE:-redis}
+    dbname: 0
+    pool_size: 50
+    max_retries: 3
+    min_idle_conns: 10
+  # Kafka: matches dev/docker/docker-compose (PLAINTEXT on localhost:9092)
+  kafka:
+    brokers: ${KAFKA_BROKERS} # Sensitive, from .env
+    security:
+      tls_enabled: false
+      sasl:
+        mechanism: ${STORAGE_KAFKA_SECURITY_SASL_MECHANISM}  # empty = no auth (local PLAINTEXT)
+        username: ${STORAGE_KAFKA_SECURITY_SASL_USER}
+        password: ${STORAGE_KAFKA_SECURITY_SASL_PASSWORD}
+    # Topics are fixed in internal/storage/eventbroker/events.go
+  # GCP project ID (used by the Pub/Sub broker)
+  gcp:
+    project_id: ${GCP_PROJECT_ID}
+  # Notification event broker (pkg/eventbroker): kafka (local) or pubsub (production/Cloud Run)
+  notification_broker:
+    type: ${NOTIFICATION_BROKER}
+
+# Authentication and secrets
+idgen:
+  snowflake:
+    # Machine ID can be set directly (0-65535), or calculated from datacenter_id + worker_id
+    # machine_id: ${MACHINE_ID:-0}  # If 0, will use datacenter_id + worker_id or auto-detect from private IP
+    datacenter_id: ${SNOWFLAKE_DATACENTER_ID:-1}  # 0-31, default: 1 (used if machine_id is 0)
+    worker_id: ${SNOWFLAKE_WORKER_ID:-1}          # 0-31, default: 1 (used if machine_id is 0)
+    # start_time: "2025-01-01T00:00:00Z"  # Optional: custom start time (RFC3339 format), defaults to 2025-01-01
+    # epoch: 1704067200000  # Deprecated: use start_time instead
+
+secrets:
+  jwt:
+    # Sensitive, from .env. Must be a >=32-byte high-entropy random secret
+    # (e.g. `openssl rand -base64 48`); release mode fail-fasts on weak keys.
+    # The Ed25519 signing key is derived from this value, so its strength
+    # equals this secret's entropy.
+    # NEVER add a `:-default` fallback here: a committed literal would let a
+    # release deploy that forgot JWT_KEY boot and sign tokens with a public key.
+    # Unset = empty = ValidateJWTKey fails fast in release. Local dev uses .env
+    # (see .env.example); ENV=test uses configs/config.test.yaml.
+    key: ${JWT_KEY}
+    # Retired signing keys kept during rotation. Tokens signed by them are still
+    # accepted until they expire; new tokens always use `key`. Remove an entry
+    # once its longest TTL (refresh_token_ttl) has elapsed.
+    # previous_keys:
+    #   - ${JWT_KEY_PREVIOUS}
+    access_token_ttl: 1h    # 1 hour
+    refresh_token_ttl: 720h # 30 days = 720 hours
+
+# Otel configs
+otel:
+  endpoint: ${OTEL_ENDPOINT}  # Sensitive, from .env
+  exporter: grpc # OTLP gRPC; must match otelutil.ExporterOTLPgRPC
+  trace:
+    enabled: false
+    sampling_ratio: 1.0
+  metric:
+    enabled: false
+    prometheus_port: 9093
+    # Bind host for the /metrics endpoint. Empty = all interfaces (0.0.0.0).
+    # The metrics port MUST NOT be reachable from the public internet: either set
+    # this to "127.0.0.1" (when Prometheus scrapes locally / via sidecar) or
+    # restrict the port with a firewall / k8s NetworkPolicy to in-cluster scrapers.
+    prometheus_host: ""
+  log:
+    enabled: false
+

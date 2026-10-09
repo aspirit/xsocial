@@ -1,0 +1,16 @@
+{
+  "name": "xsocial-backend-tooling",
+  "description": "Git hooks and commit conventions (husky, commitlint, lint-staged) for the Go backend",
+  "scripts": {
+    "prepare": "husky",
+    "commitlint": "commitlint --from=HEAD^ --to=HEAD --verbose",
+    "lint-staged": "lint-staged"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^20.3.1",
+    "@commitlint/config-conventional": "^20.3.1",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7"
+  },
+  "private": true
+}

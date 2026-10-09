@@ -1,0 +1,48 @@
+# Go
+bin/
+*.test
+testdata/
+*.prof
+vendor/
+
+# Docker
+.env
+*.env.local
+
+# Kubernetes
+*.yaml.bak
+k8s/tmp/
+
+# CI/CD
+.cache/
+node_modules/
+*.tmp
+
+# Logs and Temporary Files
+*.log
+*.log.*
+tmp/
+*.swp
+
+# IDE and Development Tools
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+.air.toml
+
+# Sensitive Information
+secrets/
+*.key
+*.pem
+.secrets
+
+# Runtime and Cache
+*.pid
+coverage/
+dist/
+*.cache
+.task/
+
+# local
+config.local.yaml

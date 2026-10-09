@@ -1,0 +1,486 @@
+basePath: /v1
+definitions:
+  auth.LoginRequest:
+    properties:
+      password:
+        example: s3cret-pass
+        type: string
+      username:
+        example: alice_01
+        type: string
+    required:
+    - password
+    - username
+    type: object
+  auth.RefreshRequest:
+    properties:
+      refreshToken:
+        type: string
+    required:
+    - refreshToken
+    type: object
+  auth.SignupRequest:
+    properties:
+      password:
+        example: s3cret-pass
+        maxLength: 64
+        minLength: 6
+        type: string
+      username:
+        example: alice_01
+        maxLength: 20
+        minLength: 5
+        type: string
+    required:
+    - password
+    - username
+    type: object
+  auth.TokenResponse:
+    properties:
+      accessToken:
+        type: string
+      expiresAt:
+        type: integer
+      refreshExpiresAt:
+        type: integer
+      refreshToken:
+        type: string
+      tokenType:
+        example: Bearer
+        type: string
+      uid:
+        example: "93686800198926369"
+        type: string
+      username:
+        example: alice_01
+        type: string
+    type: object
+  model.PostType:
+    enum:
+    - 1
+    format: int32
+    type: integer
+    x-enum-comments:
+      PostTypePost: Regular post
+    x-enum-descriptions:
+    - Regular post
+    x-enum-varnames:
+    - PostTypePost
+  notification.NotificationCollection:
+    properties:
+      notifications:
+        items:
+          $ref: '#/definitions/notification.NotificationObject'
+        type: array
+      total:
+        type: integer
+      unreadCount:
+        type: integer
+    type: object
+  notification.NotificationObject:
+    properties:
+      actType:
+        type: integer
+      createdAt:
+        description: first event
+        type: integer
+      id:
+        type: string
+      isRead:
+        type: boolean
+      postId:
+        type: string
+      postType:
+        $ref: '#/definitions/model.PostType'
+      uid:
+        type: string
+      updatedAt:
+        description: latest merged event
+        type: integer
+      who:
+        description: up to WhoMaxSize actor IDs
+        items:
+          type: string
+        type: array
+      whoCount:
+        description: Every event merged into this entry
+        type: integer
+    type: object
+  notificationhandler.UnreadCountResponse:
+    properties:
+      unread:
+        example: 3
+        type: integer
+    type: object
+  post.CreatePostRequest:
+    properties:
+      content:
+        example: Hello, world
+        type: string
+    required:
+    - content
+    type: object
+  post.PostCollection:
+    properties:
+      nextCursor:
+        type: string
+      posts:
+        items:
+          $ref: '#/definitions/post.PostObject'
+        type: array
+    type: object
+  post.PostObject:
+    properties:
+      content:
+        type: string
+      createdAt:
+        type: integer
+      id:
+        example: "93686800198926369"
+        type: string
+      likeCount:
+        type: integer
+      likedByMe:
+        type: boolean
+      uid:
+        example: "93686800198926300"
+        type: string
+    type: object
+  resp.ErrorResponse:
+    description: Standard error response with business error code and human-readable
+      message.
+    properties:
+      code:
+        description: Business error code (see apierrors package for full list)
+        example: 40001
+        type: integer
+      message:
+        description: Human-readable error description
+        example: Invalid request
+        type: string
+    type: object
+info:
+  contact: {}
+  description: 'Architecture showcase API: posts, likes and asynchronous notifications
+    over MongoDB, Redis and Kafka. Send a stable <b>X-Device-ID</b> header so rate
+    limits key on device rather than shared IPs.'
+  title: xsocial API
+  version: 0.1.0
+paths:
+  /auth/login:
+    post:
+      consumes:
+      - application/json
+      description: Exchange username + password for a token pair.
+      parameters:
+      - description: Credentials
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/auth.LoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.TokenResponse'
+        "401":
+          description: Invalid credentials
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+      summary: Log in
+      tags:
+      - auth
+  /auth/refresh-token:
+    post:
+      consumes:
+      - application/json
+      description: Exchange a refresh token for a new token pair.
+      parameters:
+      - description: Refresh token
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/auth.RefreshRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.TokenResponse'
+        "401":
+          description: Invalid refresh token
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+      summary: Refresh tokens
+      tags:
+      - auth
+  /auth/signup:
+    post:
+      consumes:
+      - application/json
+      description: Create an account with username + password and receive a token
+        pair.
+      parameters:
+      - description: Credentials
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/auth.SignupRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.TokenResponse'
+        "400":
+          description: Invalid parameters
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+        "409":
+          description: Username already exists
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+      summary: Sign up
+      tags:
+      - auth
+  /notifications:
+    get:
+      description: Notifications are produced asynchronously by the worker from broker
+        events and merged per (target, action) within a time window ("A and 3 others
+        liked your post").
+      parameters:
+      - description: Page size (default 20, max 100)
+        in: query
+        name: size
+        type: integer
+      - description: Offset
+        in: query
+        name: offset
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/notification.NotificationCollection'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: List notifications
+      tags:
+      - notification
+  /notifications/{id}/read:
+    post:
+      parameters:
+      - description: Notification ID
+        in: path
+        name: id
+        required: true
+        type: string
+      responses:
+        "200":
+          description: OK
+        "404":
+          description: Not found (or not yours)
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Mark one notification as read
+      tags:
+      - notification
+  /notifications/read-all:
+    post:
+      responses:
+        "200":
+          description: OK
+      security:
+      - BearerAuth: []
+      summary: Mark all notifications as read
+      tags:
+      - notification
+  /notifications/unread-count:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/notificationhandler.UnreadCountResponse'
+      security:
+      - BearerAuth: []
+      summary: Unread notification count
+      tags:
+      - notification
+  /posts:
+    get:
+      parameters:
+      - description: nextCursor from the previous page
+        in: query
+        name: cursor
+        type: string
+      - description: Page size (1-50, default 20)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/post.PostCollection'
+      summary: Latest posts
+      tags:
+      - post
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Post content
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/post.CreatePostRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/post.PostObject'
+        "400":
+          description: Empty or too long content
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Create a post
+      tags:
+      - post
+  /posts/{id}:
+    get:
+      description: Served from Redis when warm (cache-aside). likedByMe is set for
+        signed-in viewers.
+      parameters:
+      - description: Post ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/post.PostObject'
+        "404":
+          description: Post not found
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+      summary: Get a post
+      tags:
+      - post
+  /posts/{id}/like:
+    delete:
+      parameters:
+      - description: Post ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/post.PostObject'
+        "404":
+          description: Post not found
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Unlike a post
+      tags:
+      - post
+    post:
+      description: Idempotent. The first like notifies the author asynchronously via
+        the event broker.
+      parameters:
+      - description: Post ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/post.PostObject'
+        "404":
+          description: Post not found
+          schema:
+            $ref: '#/definitions/resp.ErrorResponse'
+      security:
+      - BearerAuth: []
+      summary: Like a post
+      tags:
+      - post
+  /users/{id}/posts:
+    get:
+      parameters:
+      - description: Author user ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: nextCursor from the previous page
+        in: query
+        name: cursor
+        type: string
+      - description: Page size (1-50, default 20)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/post.PostCollection'
+      summary: A user's posts
+      tags:
+      - post
+schemes:
+- https
+- http
+securityDefinitions:
+  BearerAuth:
+    description: 'JWT Bearer token. Format: Bearer {access_token}'
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

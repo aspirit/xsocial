@@ -1,0 +1,206 @@
+# GitLab CI/CD (self-hosted runners). Mirrors .github/workflows/ci.yml for CI and
+# adds CD: images are built once per commit, pushed to the project registry with
+# a BuildKit registry cache, and rolled out to the dev host automatically from
+# main; production is a manual, tag-only job.
+#
+# This file is the reference pipeline for a GitLab-hosted copy of the repository.
+# It is not executed on GitHub: .github/workflows/ci.yml is the live CI there.
+#
+# Versions: .gitlab-ci.variables.yml is GENERATED from versions.env (task
+# sync:ci-vars); the ci-vars-sync job fails on drift.
+# Required CI/CD variables (masked): SSH_PRIVATE_KEY, DEPLOY_HOST, DEPLOY_USER,
+# plus runtime secrets (JWT_KEY, MONGODB_URI_PRIMARY, ...) injected at deploy time.
+
+stages: [test, build, deploy-dev, deploy-prod]
+
+include:
+  - local: .gitlab-ci.variables.yml
+
+variables:
+  GOPATH: $CI_PROJECT_DIR/.go
+  GOCACHE: $CI_PROJECT_DIR/.cache/go-build
+
+cache:
+  key:
+    files: [go.sum]
+  paths: [.go, .cache/go-build]
+
+# Path filters: a service is rebuilt/redeployed only when code it depends on changes.
+.api_changes: &api_changes
+  - services/api/**/*
+  - internal/**/*
+  - pkg/**/*
+  - configs/**/*
+  - docs/api/**/*
+  - go.mod
+  - go.sum
+  - versions.env
+.worker_changes: &worker_changes
+  - services/worker/**/*
+  - internal/**/*
+  - pkg/**/*
+  - configs/**/*
+  - go.mod
+  - go.sum
+  - versions.env
+
+.on_mr_or_main: &on_mr_or_main
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+.go_job:
+  image: golang:${GO_VERSION}-alpine
+  before_script:
+    - apk add --no-cache bash git build-base curl
+    - sh -c "$(curl -fsSL https://taskfile.dev/install.sh)" -- -d -b /usr/local/bin
+    - go install golang.org/x/tools/cmd/goimports@latest
+    - export PATH=$GOPATH/bin:$PATH
+
+# ------------------------------------------------------------------ test
+ci-vars-sync:
+  stage: test
+  image: alpine:${ALPINE_VERSION}
+  script:
+    - apk add --no-cache bash git
+    - bash tools/generate-ci-vars.sh
+    - git diff --exit-code .gitlab-ci.variables.yml
+  rules: *on_mr_or_main
+
+quality:
+  stage: test
+  extends: .go_job
+  script:
+    - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v${GOLANGCI_LINT_VERSION}
+    - task check # fmt + arch rules + lint + generated-code drift
+  rules: *on_mr_or_main
+
+unit-test:
+  stage: test
+  extends: .go_job
+  script:
+    - go test -race -count=1 ./...
+  rules: *on_mr_or_main
+
+integration-test:
+  stage: test
+  extends: .go_job
+  services:
+    - name: mongo:${MONGO_VERSION}
+      alias: mongodb
+      command: ["mongod", "--replSet", "rs0", "--bind_ip_all"] # replica set: real transactions
+    - name: redis:${REDIS_VERSION}
+      alias: redis
+  variables:
+    MONGODB_URI_PRIMARY: mongodb://mongodb:27017 # the test harness initiates the replica set
+    CACHE_ADDRESS: redis:6379
+    CI_STRICT_INTEGRATION: "1"
+  script:
+    - go test -race -count=1 -tags=integration ./...
+  rules: *on_mr_or_main
+
+# ------------------------------------------------------------------ build
+.build_image:
+  stage: build
+  image: docker:${DOCKER_VERSION}
+  services: ["docker:${DOCKER_VERSION}-dind"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker buildx create --use
+  script:
+    - IMAGE="$CI_REGISTRY_IMAGE/$SERVICE"
+    - TAGS="-t $IMAGE:$CI_COMMIT_SHA"
+    - '[ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ] && TAGS="$TAGS -t $IMAGE:latest" || true'
+    - '[ -n "$CI_COMMIT_TAG" ] && TAGS="$TAGS -t $IMAGE:$CI_COMMIT_TAG" || true'
+    - >
+      docker buildx build -f services/$SERVICE/Dockerfile $TAGS --push
+      --build-arg GO_VERSION=$GO_VERSION --build-arg ALPINE_VERSION=$ALPINE_VERSION
+      --build-arg VERSION=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA} --build-arg COMMIT=$CI_COMMIT_SHA
+      --cache-from type=registry,ref=$IMAGE:buildcache
+      --cache-to type=registry,ref=$IMAGE:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+      .
+
+build:api:
+  extends: .build_image
+  variables: { SERVICE: api }
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: *api_changes
+
+build:worker:
+  extends: .build_image
+  variables: { SERVICE: worker }
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: *worker_changes
+
+# ------------------------------------------------------------------ deploy
+# Pull the exact commit image, replace the container, and gate on a health check:
+# a failed health check fails the job and prints the container logs.
+.deploy:
+  image: alpine:${ALPINE_VERSION}
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - apk add --no-cache openssh-client
+    - install -m 600 /dev/null ~/.ssh_key && echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh_key
+    - mkdir -p ~/.ssh && ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+  script:
+    - |
+      ssh -i ~/.ssh_key "$DEPLOY_USER@$DEPLOY_HOST" sh -s <<EOF
+      set -e
+      echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+      docker pull "$CI_REGISTRY_IMAGE/$SERVICE:$CI_COMMIT_SHA"
+      docker rm -f "xs-$SERVICE" 2>/dev/null || true
+      docker run -d --name "xs-$SERVICE" --restart unless-stopped --network host \
+        --env-file /etc/xsocial/$SERVICE.env -e ENV=$TARGET_ENV \
+        "$CI_REGISTRY_IMAGE/$SERVICE:$CI_COMMIT_SHA"
+      if [ -n "$HEALTH_URL" ]; then
+        for i in \$(seq 1 30); do wget -qO- "$HEALTH_URL" >/dev/null 2>&1 && exit 0; sleep 2; done
+        docker logs --tail 100 "xs-$SERVICE"; exit 1
+      fi
+      EOF
+  retry:
+    max: 2
+    when: [runner_system_failure, stuck_or_timeout_failure]
+
+deploy-dev:api:
+  extends: .deploy
+  stage: deploy-dev
+  needs: ["build:api"]
+  variables: { SERVICE: api, TARGET_ENV: stg, HEALTH_URL: "http://127.0.0.1:8080/status" }
+  environment: { name: dev }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: *api_changes
+
+# No health gate for the worker: it serves no HTTP endpoint in this extract, so
+# the job only starts the container (a crash on startup exits non-zero and shows
+# up in `docker ps -a`, not in this job's status).
+deploy-dev:worker:
+  extends: .deploy
+  stage: deploy-dev
+  needs: ["build:worker"]
+  variables: { SERVICE: worker, TARGET_ENV: stg }
+  environment: { name: dev }
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes: *worker_changes
+
+# Production: tag-only and manual. PLACEHOLDER — the script only echoes. Wire it to
+# the target environment (e.g. a rolling update of the managed runtime with
+# several API replicas behind a load balancer, see docs/ARCHITECTURE.md).
+deploy-prod:
+  stage: deploy-prod
+  image: alpine:${ALPINE_VERSION}
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "Promote $CI_COMMIT_TAG images to production (rolling update)"
+  environment: { name: production }
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: manual

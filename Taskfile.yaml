@@ -1,0 +1,204 @@
+# Taskfile — the single entry point for local development and CI.
+# CI calls the same tasks a developer runs, so "works on my machine" == "works in CI".
+# Docs: https://taskfile.dev     Usage: task <name>   (task --list for all)
+
+version: '3'
+
+vars:
+  BINARY_DIR: bin
+  # Version metadata injected into binaries via -ldflags (see internal/version).
+  VERSION_PKG: github.com/aspirit/xsocial/internal/version
+  GIT_COMMIT:
+    sh: git rev-parse --short HEAD 2>/dev/null || echo unknown
+  BUILD_VERSION:
+    sh: git describe --tags --always 2>/dev/null || echo dev
+  BUILD_TIME:
+    sh: date -u +%Y-%m-%dT%H:%M:%SZ
+  VERSION_LDFLAGS: >-
+    -X '{{.VERSION_PKG}}.Version={{.BUILD_VERSION}}'
+    -X '{{.VERSION_PKG}}.Commit={{.GIT_COMMIT}}'
+    -X '{{.VERSION_PKG}}.BuildTime={{.BUILD_TIME}}'
+  COMPOSE: docker compose --env-file versions.env --env-file .env -f dev/docker/docker-compose.yaml
+
+# versions.env is the single source of truth for toolchain/infra versions.
+dotenv: [".env", "versions.env"]
+
+tasks:
+  default:
+    cmds: [task --list]
+
+  # ---------------------------------------------------------------- quality gates
+  check:
+    desc: Everything CI runs before tests (format, lint, architecture, generated code, tagged tests compile)
+    cmds:
+      - task: fmt:check
+      - task: arch-check
+      - task: lint:check
+      - task: vet:integration
+      - task: gen:check
+
+  vet:integration:
+    desc: Compile and vet the integration-tagged tests (golangci-lint runs without the tag)
+    cmds:
+      - go vet -tags=integration ./...
+
+  fmt:
+    desc: Format Go code (gofmt + goimports)
+    cmds:
+      - gofmt -w internal pkg services tools
+      - goimports -l internal pkg services tools | grep -v wire_gen.go | xargs -r goimports -w
+
+  fmt:check:
+    desc: Fail if any file is not formatted
+    cmds:
+      - test -z "$(gofmt -l internal pkg services tools)"
+      # wire_gen.go is generated (wire controls its imports); gen:check guards it instead.
+      - test -z "$(goimports -l internal pkg services tools | grep -v wire_gen.go)"
+
+  lint:
+    desc: Run golangci-lint with auto-fix
+    cmds:
+      - golangci-lint run ./... --fix --timeout=10m
+
+  lint:check:
+    desc: Run golangci-lint (check only)
+    cmds:
+      - golangci-lint run ./... --timeout=10m
+
+  arch-check:
+    desc: Enforce layer dependency rules (scripts/check-arch.sh)
+    cmds:
+      - ./scripts/check-arch.sh
+
+  # ---------------------------------------------------------------- code generation
+  gen:
+    desc: Run every generator (Mongo fields, Wire, OpenAPI)
+    cmds:
+      - task: gen:mongo
+      - task: gen:wire
+      - task: gen:api-docs
+
+  gen:check:
+    desc: Fail if generated code is stale (regenerate, then diff)
+    cmds:
+      - task: gen
+      - git diff --exit-code -- internal/storage/mongo/field internal/storage/mongo/collections.go services/api/wire/wire_gen.go services/worker/wire/wire_gen.go docs/api
+
+  gen:mongo:
+    desc: Generate type-safe MongoDB field and collection constants from internal/model
+    cmds:
+      - go run ./tools/mongo-codegen/generator.go
+    sources:
+      - internal/model/*.go
+      - tools/mongo-codegen/*.go
+      - tools/mongo-codegen/*.template
+
+  gen:wire:
+    desc: Generate Wire dependency injection code
+    cmds:
+      - go run github.com/google/wire/cmd/wire@v${WIRE_VERSION} gen ./services/api/wire ./services/worker/wire
+    sources:
+      - services/*/wire/wire.go
+      - internal/wire/*.go
+
+  gen:api-docs:
+    desc: Generate OpenAPI (Swagger 2.0) from handler annotations
+    cmds:
+      - go run github.com/swaggo/swag/cmd/swag@v${SWAG_VERSION} init -q -g services/api/main.go -o docs/api
+    sources:
+      - services/api/**/*.go
+      - internal/domains/**/dto.go
+      - internal/model/*.go
+
+  sync:ci-vars:
+    desc: Regenerate .gitlab-ci.variables.yml from versions.env
+    sources: [versions.env]
+    generates: [.gitlab-ci.variables.yml]
+    cmds:
+      - bash tools/generate-ci-vars.sh
+
+  # ---------------------------------------------------------------- local stack
+  dev:up:
+    desc: Start MongoDB, Redis, Kafka (+Kafdrop) and Jaeger
+    cmds:
+      - '{{.COMPOSE}} up -d'
+
+  dev:down:
+    desc: Stop the local stack
+    cmds:
+      - '{{.COMPOSE}} down'
+
+  dev:cluster:
+    desc: Add 2 API (:8101, :8102) + 2 worker replicas to the local stack (profile "cluster")
+    cmds:
+      - '{{.COMPOSE}} --profile cluster up -d --build'
+
+  dev:cluster:down:
+    desc: Stop the replicas (the data stores keep running)
+    cmds:
+      - '{{.COMPOSE}} --profile cluster stop api-1 api-2 worker-1 worker-2'
+      - '{{.COMPOSE}} --profile cluster rm -f api-1 api-2 worker-1 worker-2'
+
+  run:api:
+    desc: Run the API service (http://localhost:8080, Swagger at /swagger/index.html)
+    cmds:
+      - go run ./services/api
+
+  run:worker:
+    desc: Run the worker (event consumer + scheduled jobs)
+    cmds:
+      - go run ./services/worker
+
+  run:api:test:
+    desc: Run the API against the isolated test database (ENV=test, :8081)
+    cmds:
+      - ENV=test go run ./services/api
+
+  # ---------------------------------------------------------------- tests
+  test:
+    desc: Unit tests, then integration tests
+    cmds:
+      - task: test:unit
+      - task: test:integration
+
+  test:unit:
+    desc: Unit tests (no external services; domains run against in-memory fakes)
+    cmds:
+      - go test -race -count=1 ./...
+
+  test:integration:
+    desc: 'Integration + E2E tests against real MongoDB/Redis (build tag: integration)'
+    cmds:
+      - go test -race -count=1 -tags=integration ./internal/... ./services/...
+
+  test:coverage:
+    desc: Unit + integration coverage report (coverage.html)
+    cmds:
+      - go test -count=1 -tags=integration -coverprofile=coverage.out ./...
+      - go tool cover -func=coverage.out | tail -1
+      - go tool cover -html=coverage.out -o coverage.html
+
+  # ---------------------------------------------------------------- build
+  build:
+    desc: Build both binaries into bin/ with version metadata
+    cmds:
+      - CGO_ENABLED=0 go build -trimpath -ldflags "{{.VERSION_LDFLAGS}}" -o {{.BINARY_DIR}}/api ./services/api
+      - CGO_ENABLED=0 go build -trimpath -ldflags "{{.VERSION_LDFLAGS}}" -o {{.BINARY_DIR}}/worker ./services/worker
+
+  docker:build:
+    desc: Build both service images with versions from versions.env
+    vars:
+      ARGS: >-
+        --build-arg GO_VERSION=${GO_VERSION}
+        --build-arg ALPINE_VERSION=${ALPINE_VERSION}
+        --build-arg VERSION={{.BUILD_VERSION}}
+        --build-arg COMMIT={{.GIT_COMMIT}}
+        --build-arg BUILD_TIME={{.BUILD_TIME}}
+    cmds:
+      - docker build {{.ARGS}} -f services/api/Dockerfile -t xsocial-api:{{.GIT_COMMIT}} .
+      - docker build {{.ARGS}} -f services/worker/Dockerfile -t xsocial-worker:{{.GIT_COMMIT}} .
+
+  clean:
+    desc: Remove build and coverage artifacts
+    cmds:
+      - rm -rf {{.BINARY_DIR}} coverage.out coverage.html

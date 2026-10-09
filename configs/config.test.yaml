@@ -1,0 +1,39 @@
+# Test overrides (merged on top of config.default.yaml when ENV=test).
+# Used by `task run:api:test` and DB-backed integration tests against the
+# local docker-compose stack (dev/docker). Never used outside a laptop / CI.
+version: 0.1.0
+
+project:
+  id: xs
+  mode: debug
+
+services:
+  api:
+    id: xs-api
+    addr: ":8081"
+
+logging:
+  level: info
+  output_path: stdout
+  format: console
+
+storage:
+  mongodb:
+    primary:
+      uri: "mongodb://127.0.0.1:27017"
+      username: root
+      password: password
+      auth_source: admin
+    # Logical → physical database name: tests never touch the dev database.
+    database_overrides:
+      xs_db: xs_test
+  redis:
+    address: "127.0.0.1:6379"
+    password: "redis-password"
+    dbname: 1
+
+secrets:
+  jwt:
+    key: "test-only-signing-secret-do-not-use-anywhere-else"
+    access_token_ttl: "15m"
+    refresh_token_ttl: "168h"

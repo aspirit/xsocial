@@ -1,0 +1,65 @@
+# Staging overrides (merged on top of config.default.yaml when ENV=stg).
+# Secrets never live here: they come from the environment / a secret manager.
+version: 0.1.0
+
+meta:
+  last_updated: 2026-10-01T00:00:00Z
+  description: Staging configuration overrides
+  owner: backend
+
+project:
+  id: xs
+  mode: release   # release mode fail-fasts on a weak JWT key or disabled rate limiting
+
+services:
+  api:
+    id: xs-api
+    # Only the load balancer / ingress may set X-Forwarded-For; otherwise
+    # ClientIP (rate-limit keys) could be spoofed.
+    trusted_proxies:
+      - ${TRUSTED_PROXY_CIDR:-10.0.0.0/8}
+    cors:
+      enabled: true
+      allow_origins:
+        - "${WEB_ORIGIN:-https://app.example.com}"
+      allow_credentials: true
+      allow_wildcard_subdomains: false
+  worker:
+    id: xs-worker
+
+logging:
+  level: info
+  output_path: stdout
+  format: json
+  development: false
+
+# Shared counters in Redis so limits hold across every API replica.
+ratelimit:
+  enabled: true
+  storage: "cache"
+  ip_hard_limit_multiplier: 5
+
+worker_jobs:
+  reconcile:
+    enabled: true
+    interval: 1h
+    correct: true
+
+storage:
+  redis:
+    tls_enabled: true          # managed Redis (e.g. Memorystore) requires TLS
+  notification_broker:
+    type: ${NOTIFICATION_BROKER:-pubsub}
+
+secrets:
+  jwt:
+    # previous_keys:
+    #   - ${JWT_KEY_PREVIOUS}   # keep during a key rotation window
+
+otel:
+  trace:
+    enabled: true
+    sampling_ratio: 0.1
+  metric:
+    enabled: true
+    prometheus_host: "127.0.0.1"   # scraped by a sidecar; never public
